@@ -10,7 +10,10 @@ use IO::All -utf8;
 use Mojolicious::Lite;
 use WWW::Mechanize;
 
-use constant CACHE_DURATION => "1 hour";
+# For how long should the list of news be cached?
+use constant LIST_CACHE_DURATION => "3 hours";
+# For how long should the text of news items be cached?
+use constant ITEM_CACHE_DURATION => "12 hours";
 
 my ($USERNAME, $PASSWORD) = io("$Bin/.ku_credentials")->slurp =~ /^([^:]+):(.*)$/;
 
@@ -24,6 +27,8 @@ my $mech = WWW::Mechanize->new();
 $mech->agent_alias('Windows Mozilla');
 
 my $cache = CHI->new( driver => 'Memory', global => 1 );
+
+my $log = Mojo::Log->new;
 
 ######
 # Message fetching
@@ -49,7 +54,7 @@ sub login {
 }
 
 sub messages {
-    return $cache->compute("messages", CACHE_DURATION, sub {
+    return $cache->compute("message_list", LIST_CACHE_DURATION, sub {
         $mech->get('https://intranet.ku.dk/nyheder/studiebeskeder/Sider/default.aspx');
         login();
 
@@ -69,13 +74,36 @@ sub messages {
             my $id = sha256_hex($url);
 
             push( @$res, {
-                id     => $id,
-                title  => $title,
-                url    => $url,
-                source => $source,
-                date   => $date,
+                id      => $id,
+                title   => $title,
+                url     => "/message/$id",
+                src_url => $url,
+                source  => $source,
+                date    => $date,
             } );
         }
+
+        return $res;
+    });
+}
+
+sub get_message {
+    my $id = shift;
+    return $cache->compute("message_$id", ITEM_CACHE_DURATION, sub {
+        my $messages = messages();
+        $messages = $messages->[0] if ref $messages->[0] eq 'ARRAY'; # wtf? why does this become double-nested?
+        my ($message) = grep { ref $_ && ($_->{id} eq $id) } @$messages;
+
+        return { error => "Unknown news item." } unless ($message);
+
+        $mech->get($message->{src_url});
+        login();
+
+        my $q = Query( text => $mech->response->decoded_content );
+        my $content = $q->query('.content')->first;
+        my $res = { %$message };
+
+        $res->{html} = $content->as_HTML;
 
         return $res;
     });
@@ -89,6 +117,12 @@ get '/' => sub {
     my $c = shift;
 
     $c->render(json => messages);
+};
+
+get '/message/:id' => [id => qr/[\da-f]+/i] => sub {
+    my $c = shift;
+
+    $c->render(json => get_message($c->stash('id')));
 };
 
 app->start;
